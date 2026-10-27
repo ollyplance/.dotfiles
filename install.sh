@@ -195,7 +195,26 @@ install_packages_macos() {
     [[ -x /usr/local/bin/brew ]] && eval "$(/usr/local/bin/brew shellenv)"
   fi
   info "brew" "installing ~30 formulae/casks; first run typically 5-15 min (downloads show below)"
-  run brew bundle --verbose --file="$DOTFILES_DIR/Brewfile"
+  # Never race another brew (a second install.sh, a brew in another window...):
+  # concurrent installs fail with "process has already locked .../Cellar/<pkg>".
+  while [[ $DRY -eq 0 ]] && pgrep -qf 'Homebrew/brew.rb'; do
+    info "waiting" "another brew process is running (pgrep -fl brew); retrying in 15s"
+    sleep 15
+  done
+  # Parallel installs inside brew bundle can still collide on shared deps
+  # (e.g. cmake), so retry: each pass only redoes what failed.
+  local attempt
+  for attempt in 1 2 3; do
+    # (only the first pass auto-updates Homebrew)
+    if [[ $attempt -gt 1 ]]; then export HOMEBREW_NO_AUTO_UPDATE=1; fi
+    if run brew bundle --verbose --file="$DOTFILES_DIR/Brewfile"; then break; fi
+    if [[ $attempt -lt 3 ]]; then
+      warn "brew bundle pass $attempt had failures (often just lock collisions); retrying..."
+      sleep 5
+    else
+      warn "brew bundle still failing after 3 passes; run: brew bundle --file=$DOTFILES_DIR/Brewfile"
+    fi
+  done
 }
 
 install_packages_linux() {
