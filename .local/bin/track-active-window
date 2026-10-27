@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# --- TRACK-ACTIVE-WINDOW: Workspace Context & MRU Tracker ---
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+# Serialize execution so concurrent hooks never race
+LOCK_FILE="/tmp/tmux_track_active_${UID:-$(id -u)}.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    flock -w 2 9 || exit 0
+else
+    # macOS has no flock(1): fall back to an atomic mkdir lock (2s timeout, stale after 10s)
+    LOCK_DIR="${LOCK_FILE}.d"
+    got_lock=0
+    for _ in $(seq 1 20); do
+        if mkdir "$LOCK_DIR" 2>/dev/null; then got_lock=1; break; fi
+        if (( $(date +%s) - $(ws_file_mtime "$LOCK_DIR") > 10 )); then
+            rmdir "$LOCK_DIR" 2>/dev/null
+            continue
+        fi
+        sleep 0.1
+    done
+    (( got_lock )) || exit 0
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+fi
+
+arg_sess=""
+arg_wid=""
+for arg in "$@"; do
+    if [[ "$arg" == @* ]]; then
+        arg_wid="$arg"
+    elif [[ "$arg" == \$* ]]; then
+        arg_sess="$arg"
+    fi
+done
+
+curr_sess="$arg_sess"
+if [[ -z "$curr_sess" && -n "$arg_wid" ]]; then
+    curr_sess=$(tmux display-message -t "$arg_wid" -p '#{session_id}' 2>/dev/null)
+fi
+if [[ -z "$curr_sess" ]]; then
+    curr_sess=$(tmux list-clients -F '#{client_session}' 2>/dev/null | head -n1)
+fi
+if [[ -z "$curr_sess" ]]; then
+    curr_sess=$(tmux display-message -p '#{session_id}' 2>/dev/null)
+fi
+if [[ -z "$curr_sess" ]]; then
+    exit 0
+fi
+
+TAB=$'\t'
+raw_wins=$(tmux list-windows -t "$curr_sess" -F "#{window_id}${TAB}#{window_active}${TAB}#{@workspace_name}${TAB}#{pane_current_path}${TAB}#{@initial_path}" 2>/dev/null)
+if [[ -z "$raw_wins" ]]; then
+    exit 0
+fi
+
+declare -A win_exists=()
+declare -A win_ws=()
+declare -A ws_alive=()
+curr_wid=""
+curr_ws=""
+
+while IFS="$TAB" read -r wid wactive w_ws wpath winit; do
+    if [[ -z "$wid" ]]; then continue; fi
+    if [[ -z "$w_ws" ]]; then
+        effective_path="$wpath"
+        if [[ -n "$winit" && ( "$wpath" == "$HOME" || -z "$wpath" ) && "$winit" != "$HOME" ]]; then
+            effective_path="$winit"
+        fi
+        w_ws=$(ws_resolve_name "$effective_path")
+    fi
+    win_exists["$wid"]=1
+    win_ws["$wid"]="$w_ws"
+    if [[ -n "$w_ws" ]]; then
+        ws_alive["$w_ws"]=1
+    fi
+    if [[ "$wactive" == "1" ]]; then
+        curr_wid="$wid"
+        curr_ws="$w_ws"
+    fi
+done <<< "$raw_wins"
+
+if [[ -z "$curr_wid" ]]; then
+    exit 0
+fi
+
+now=$(ws_now_ms)
+
+active_wid=$(tmux show-option -t "$curr_sess" -qv @active_wid 2>/dev/null)
+active_ws=$(tmux show-option -t "$curr_sess" -qv @active_ws 2>/dev/null)
+
+declare -a cmds=()
+
+if [[ "$curr_wid" != "$active_wid" || ( -n "$curr_ws" && "$curr_ws" != "$active_ws" ) ]]; then
+    if [[ -n "$active_ws" && -n "$active_wid" ]]; then
+        if [[ "$curr_wid" != "$active_wid" && -n "${win_exists[$active_wid]}" ]]; then
+            old_ws="${win_ws[$active_wid]}"
+            if [[ -z "$old_ws" || "$old_ws" == "$active_ws" ]]; then
+                cmds+=(set-option -t "$curr_sess" "@last_win_for_${active_ws}" "$active_wid" \;)
+                cmds+=(set-option -w -t "$active_wid" @win_last_used "$((now - 1))" \;)
+            fi
+        fi
+        if [[ -n "$curr_ws" && "$active_ws" != "$curr_ws" ]]; then
+            if [[ -n "${ws_alive[$active_ws]}" ]]; then
+                cmds+=(set-option -t "$curr_sess" @prev_workspace "$active_ws" \;)
+                if [[ -n "${win_exists[$active_wid]}" ]]; then
+                    cmds+=(set-option -t "$curr_sess" @prev_workspace_wid "$active_wid" \;)
+                fi
+                cmds+=(set-option -t "$curr_sess" "@ws_last_used_${active_ws}" "$((now - 1))" \;)
+            else
+                # Clean up options for workspace whose last window was closed
+                cmds+=(set-option -t "$curr_sess" -u "@last_win_for_${active_ws}" \;)
+                cmds+=(set-option -t "$curr_sess" -u "@ws_last_used_${active_ws}" \;)
+            fi
+        fi
+    fi
+
+    if [[ "$curr_wid" != "$active_wid" && -n "$active_wid" && -n "${win_exists[$active_wid]}" ]]; then
+        cmds+=(set-option -t "$curr_sess" @prev_active_wid "$active_wid" \;)
+    fi
+    cmds+=(set-option -t "$curr_sess" @active_wid "$curr_wid" \;)
+    if [[ -n "$curr_ws" ]]; then
+        cmds+=(set-option -t "$curr_sess" @active_ws "$curr_ws" \;)
+    fi
+fi
+
+cmds+=(set-option -w -t "$curr_wid" @win_last_used "$now" \;)
+if [[ -n "$curr_ws" ]]; then
+    cmds+=(set-option -t "$curr_sess" "@last_win_for_${curr_ws}" "$curr_wid" \;)
+    cmds+=(set-option -t "$curr_sess" "@ws_last_used_${curr_ws}" "$now" \;)
+fi
+
+if [[ ${#cmds[@]} -gt 0 ]]; then
+    tmux "${cmds[@]}" 2>/dev/null
+fi
+
+exit 0

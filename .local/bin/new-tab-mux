@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+# --- NEW-TAB-MUX: Smart New Tab Picker ---
+# Defaults to ~ (press Enter immediately to open a new tab at ~).
+# Lists MRU directories from zoxide (if installed) and opens the chosen one with
+# smart-new-tab so the tab lands inside its workspace cluster.
+# Typing a path/zoxide query that matches no row opens it directly (Ctrl-F creates it).
+#
+# Extension point: if ~/.local/bin/new-tab-mux-hook.sh exists it is sourced and may define
+#   new_tab_provider_rows                -> print extra rows "name\tdesc\tmeta\ttoken"
+#   new_tab_provider_open TOKEN [-f]     -> open/create TOKEN (non-matching queries and
+#                                           provider rows are routed here)
+#   NEW_TAB_HEADER / NEW_TAB_PROMPT       -> fzf header / prompt text
+#   NEW_TAB_INCLUDE_DIRS=0                -> hide the generic zoxide directory rows
+#   NEW_TAB_NTH                           -> fzf --nth search fields (default "1,2")
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+TAB=$'\t'
+NEW_TAB_INCLUDE_DIRS=1
+NEW_TAB_HEADER="Enter: Open Tab (~ default, or <query> as path/zoxide match) │ Ctrl-F: create dir <query>"
+NEW_TAB_PROMPT="New Tab > "
+NEW_TAB_NTH="1,2"
+
+current_sess=$(tmux display-message -p '#{session_id}' 2>/dev/null)
+
+# Count currently open tabs per workspace in tmux
+declare -A ws_tab_count=()
+if [[ -n "$current_sess" ]]; then
+    while IFS="$TAB" read -r wpath ws_name; do
+        ws=""
+        if [[ -n "$ws_name" ]]; then
+            ws="$ws_name"
+        elif [[ -n "$wpath" ]]; then
+            ws=$(ws_resolve_name_simple "$wpath")
+        fi
+        if [[ -n "$ws" ]]; then
+            ws_tab_count["$ws"]=$(( ${ws_tab_count["$ws"]:-0} + 1 ))
+        fi
+    done < <(tmux list-windows -t "$current_sess" -F "#{pane_current_path}${TAB}#{@workspace_name}" 2>/dev/null)
+fi
+
+# "[N tab(s)]" badge for a workspace name (empty if none open)
+ntm_tab_badge() {
+    local cnt="${ws_tab_count["$1"]}"
+    if [[ -n "$cnt" ]]; then
+        echo "[${cnt} tab$([ "$cnt" -gt 1 ] && echo 's')]"
+    fi
+}
+
+hook="$HOME/.local/bin/new-tab-mux-hook.sh"
+if [[ -r "$hook" ]]; then
+    # shellcheck source=/dev/null
+    . "$hook"
+fi
+have_provider_open=0
+if declare -F new_tab_provider_open >/dev/null; then
+    have_provider_open=1
+fi
+
+formatted_lines=""
+
+# 1. Default first row: ~ ($HOME)
+home_tabs=$(ntm_tab_badge "~")
+row=$(printf "%-28s\t%-46s\t%-22s\t%s" "~" "Home Directory ($HOME)" "${home_tabs:-[default]}" "__HOME__")
+formatted_lines+="${row}"$'\n'
+
+# 2. Provider rows (e.g. remote workspaces), if any
+if declare -F new_tab_provider_rows >/dev/null; then
+    formatted_lines+="$(new_tab_provider_rows)"$'\n'
+fi
+
+# 3. MRU directories from zoxide
+if [[ "$NEW_TAB_INCLUDE_DIRS" == "1" ]] && command -v zoxide >/dev/null 2>&1; then
+    while IFS= read -r dir; do
+        [[ -z "$dir" || "$dir" == "$HOME" || ! -d "$dir" ]] && continue
+        pretty="$dir"
+        [[ "$dir" == "$HOME"* ]] && pretty="~${dir#"$HOME"}"
+        ws=$(ws_resolve_name "$dir")
+        row=$(printf "%-28s\t%-46s\t%-22s\t%s" "${dir##*/}" "$pretty" "$(ntm_tab_badge "$ws")" "dir:${dir}")
+        formatted_lines+="${row}"$'\n'
+    done < <(zoxide query -l 2>/dev/null | head -n 40)
+fi
+
+fzf_out=$(printf "%s" "$formatted_lines" | sed '/^[[:space:]]*$/d' | fzf \
+  --reverse \
+  --print-query \
+  --expect="ctrl-f,alt-enter" \
+  --delimiter="$TAB" \
+  --nth="$NEW_TAB_NTH" \
+  --with-nth=1,2,3 \
+  --header="$NEW_TAB_HEADER" \
+  --prompt="$NEW_TAB_PROMPT" \
+  --bind 'ctrl-j:down,ctrl-k:up')
+fzf_status=$?
+
+# Exit immediately if cancelled with Esc / Ctrl-C (status 130) or error (status 2)
+if [[ $fzf_status -eq 130 || $fzf_status -eq 2 ]]; then
+    exit 0
+fi
+
+query=$(printf "%s\n" "$fzf_out" | sed -n '1p')
+pressed_key=$(printf "%s\n" "$fzf_out" | sed -n '2p')
+selected_line=$(printf "%s\n" "$fzf_out" | sed -n '3p')
+
+# Trim whitespace around query
+query="${query#"${query%%[![:space:]]*}"}"
+query="${query%"${query##*[![:space:]]}"}"
+
+fail() {
+    printf "\n\033[1;31mError: %s\033[0m\n" "$1"
+    read -n 1 -s -r -p "Press any key to close..."
+    exit 1
+}
+
+# Open a free-form query: provider first (if any), else path / zoxide / mkdir.
+open_query() {
+    local q="$1" force="$2" dir=""
+    if [[ "$q" == "~" || -z "$q" ]]; then
+        ~/.local/bin/smart-new-tab "$HOME"
+        return
+    fi
+    if (( have_provider_open )); then
+        new_tab_provider_open "$q" "$force"
+        return
+    fi
+    dir="${q/#\~/$HOME}"
+    if [[ -d "$dir" ]]; then
+        :
+    elif [[ "$force" == "-f" ]]; then
+        [[ "$dir" != /* ]] && dir="$HOME/$dir"
+        mkdir -p "$dir" || fail "could not create $dir"
+    elif command -v zoxide >/dev/null 2>&1 && dir=$(zoxide query -- "$q" 2>/dev/null) && [[ -d "$dir" ]]; then
+        :
+    else
+        fail "no directory matches '$q' (Ctrl-F creates it)"
+    fi
+    ~/.local/bin/smart-new-tab "$dir"
+}
+
+open_token() {
+    local token="$1" force="$2"
+    case "$token" in
+        __HOME__) ~/.local/bin/smart-new-tab "$HOME" ;;
+        dir:*)    ~/.local/bin/smart-new-tab "${token#dir:}" ;;
+        *)
+            if (( have_provider_open )); then
+                new_tab_provider_open "$token" "$force"
+            else
+                open_query "$token" "$force"
+            fi
+            ;;
+    esac
+}
+
+# 1. Explicit Ctrl-F / Alt-Enter -> Force create/open query
+if [[ "$pressed_key" == "ctrl-f" || "$pressed_key" == "alt-enter" ]]; then
+    if [[ -n "$query" ]]; then
+        open_query "$query" "-f"
+    elif [[ -n "$selected_line" ]]; then
+        open_token "$(printf "%s" "$selected_line" | cut -f4)" "-f"
+    fi
+    exit 0
+fi
+
+# 2. A list item matched and was selected with Enter
+if [[ -n "$selected_line" ]]; then
+    open_token "$(printf "%s" "$selected_line" | cut -f4)" ""
+    exit 0
+fi
+
+# 3. No list item matched the query -> open it (providers create it, like Ctrl-F)
+if [[ -n "$query" ]]; then
+    if (( have_provider_open )); then
+        open_query "$query" "-f"
+    else
+        open_query "$query" ""
+    fi
+fi

@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+# --- TOGGLE-WORKSPACE: Instant MRU Workspace & Tab Switcher ---
+# Toggles between the current workspace and the most recently used workspace,
+# restoring the exact window and pane you were last using.
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+is_double=0
+args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--double" ]]; then
+        is_double=1
+    else
+        args+=("$arg")
+    fi
+done
+
+curr_sess="${args[0]:-$(tmux display-message -p '#{session_id}')}"
+curr_wid="${args[1]:-$(tmux display-message -p '#{window_id}')}"
+
+# Handle double-tap detection if triggered directly from root key table
+if [[ $is_double -eq 1 ]]; then
+    now=$(ws_now_ms)
+    last_press=$(tmux show-option -t "$curr_sess" -qv @last_toggle_press 2>/dev/null)
+    last_press="${last_press:-0}"
+    diff=$(( now - last_press ))
+
+    if (( diff > 0 && diff < 800 )); then
+        # Double-tap confirmed! Proceed with workspace toggle
+        tmux set-option -t "$curr_sess" @last_toggle_press 0
+    else
+        # First press: record timestamp and wait for second tap
+        tmux set-option -t "$curr_sess" @last_toggle_press "$now"
+        exit 0
+    fi
+fi
+
+curr_ws=$(tmux display-message -t "$curr_wid" -p '#{@workspace_name}' 2>/dev/null)
+if [[ -z "$curr_ws" ]]; then
+    curr_path=$(tmux display-message -t "$curr_wid" -p '#{pane_current_path}' 2>/dev/null)
+    curr_ws=$(ws_resolve_name_simple "$curr_path")
+fi
+
+target_wid=""
+TAB=$'\t'
+raw_wins=$(tmux list-windows -t "$curr_sess" -F "#{window_id}${TAB}#{@workspace_name}${TAB}#{pane_current_path}${TAB}#{@win_last_used}${TAB}#{window_activity}${TAB}#{window_active}")
+
+declare -A win_ws=()
+declare -A ws_best_wid=()
+declare -A ws_best_score=()
+declare -a other_ws=()
+
+while IFS="$TAB" read -r wid w_ws wpath wlast wact wactive; do
+    if [[ -z "$wid" ]]; then continue; fi
+    if [[ -z "$w_ws" ]]; then
+        w_ws=$(ws_resolve_name_simple "$wpath")
+    fi
+    win_ws["$wid"]="$w_ws"
+
+    if [[ "$wactive" -eq 1 ]]; then
+        curr_wid="$wid"
+        curr_ws="$w_ws"
+    else
+        score="${wlast:-0}"
+        if [[ -z "$score" || "$score" -le 0 ]]; then
+            score="${wact:-0}"
+        fi
+        if [[ -z "${ws_best_score[$w_ws]}" ]] || (( score > ws_best_score[$w_ws] )); then
+            ws_best_score["$w_ws"]="$score"
+            ws_best_wid["$w_ws"]="$wid"
+        fi
+        if [[ "$w_ws" != "$curr_ws" ]]; then
+            seen=0
+            for ow in "${other_ws[@]}"; do
+                if [[ "$ow" == "$w_ws" ]]; then seen=1; break; fi
+            done
+            if [[ $seen -eq 0 ]]; then
+                other_ws+=("$w_ws")
+            fi
+        fi
+    fi
+done <<< "$raw_wins"
+
+# Make sure current active window/workspace is recorded before we switch away
+if [[ -n "$curr_wid" && -n "$curr_ws" ]]; then
+    tmux set-option -t "$curr_sess" @active_wid "$curr_wid" \; \
+         set-option -t "$curr_sess" @active_ws "$curr_ws" \; \
+         set-option -t "$curr_sess" "@last_win_for_${curr_ws}" "$curr_wid" 2>/dev/null
+fi
+
+# 1. Look for the recorded previous workspace
+prev_ws=$(tmux show-option -t "$curr_sess" -qv @prev_workspace 2>/dev/null)
+
+if [[ -n "$prev_ws" && "$prev_ws" != "$curr_ws" ]]; then
+    saved_wid=$(tmux show-option -t "$curr_sess" -qv "@last_win_for_${prev_ws}" 2>/dev/null)
+    if [[ -n "$saved_wid" && "${win_ws[$saved_wid]}" == "$prev_ws" ]]; then
+        target_wid="$saved_wid"
+    elif [[ -n "${ws_best_wid[$prev_ws]}" ]]; then
+        target_wid="${ws_best_wid[$prev_ws]}"
+    fi
+fi
+
+# 2. If no valid previous workspace found, find the most recently focused alternative workspace
+if [[ -z "$target_wid" && ${#other_ws[@]} -gt 0 ]]; then
+    best_alt_ws=$(
+        for ow in "${other_ws[@]}"; do
+            if [[ "$ow" == "$curr_ws" ]]; then continue; fi
+            ws_used=$(tmux show-option -t "$curr_sess" -qv "@ws_last_used_${ow}" 2>/dev/null)
+            prio=0
+            if [[ -n "$ws_used" && "$ws_used" -gt 0 ]]; then
+                prio=1
+            fi
+            score="${ws_used:-${ws_best_score[$ow]:-0}}"
+            echo "${prio} ${score} ${ow}"
+        done | sort -k1,1rn -k2,2rn | head -n1 | awk '{print $3}'
+    )
+    if [[ -n "$best_alt_ws" ]]; then
+        saved_wid=$(tmux show-option -t "$curr_sess" -qv "@last_win_for_${best_alt_ws}" 2>/dev/null)
+        if [[ -n "$saved_wid" && "${win_ws[$saved_wid]}" == "$best_alt_ws" ]]; then
+            target_wid="$saved_wid"
+        else
+            target_wid="${ws_best_wid[$best_alt_ws]}"
+        fi
+    fi
+fi
+
+# 3. Fallback for single-workspace sessions: toggle to previous window/tab
+if [[ -z "$target_wid" ]]; then
+    prev_wid=$(tmux show-option -t "$curr_sess" -qv @prev_active_wid 2>/dev/null)
+    if [[ -n "$prev_wid" && "$prev_wid" != "$curr_wid" && -n "${win_ws[$prev_wid]}" ]]; then
+        target_wid="$prev_wid"
+    fi
+fi
+
+if [[ -z "$target_wid" ]]; then
+    last_win=$(tmux list-windows -t "$curr_sess" -F '#{window_id}	#{window_last_flag}' | awk -F'\t' '$2 == "1" {print $1}')
+    if [[ -n "$last_win" && "$last_win" != "$curr_wid" ]]; then
+        target_wid="$last_win"
+    fi
+fi
+
+if [[ -n "$target_wid" ]]; then
+    tmux select-window -t "$target_wid"
+    ~/.local/bin/track-active-window "$curr_sess" >/dev/null 2>&1
+fi
+
+exit 0

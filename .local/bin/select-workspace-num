@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+# --- SELECT-WORKSPACE-NUM: Direct 1-9 Tab Bar Workspace Switcher ---
+# Jumps directly to the Nth workspace as ordered left-to-right in the top status bar,
+# restoring the last active tab within that workspace.
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+target_num="$1"
+if [[ -z "$target_num" || ! "$target_num" =~ ^[1-9][0-9]*$ ]]; then
+    exit 0
+fi
+
+TAB=$'\t'
+current_sess="${2:-$(tmux display-message -p '#{session_id}')}"
+raw=$(tmux list-windows -t "$current_sess" -F "#{window_id}${TAB}#{window_index}${TAB}#{pane_current_path}${TAB}#{@workspace_name}${TAB}#{window_activity}${TAB}#{@win_last_used}" | sort -t"$TAB" -k2,2n)
+
+if [[ -z "$raw" ]]; then
+    exit 0
+fi
+
+declare -A win_exists=()
+declare -A win_ws=()
+declare -A ws_mru_wid=()
+declare -A ws_max_score=()
+declare -A seen_ws_first_wid=()
+declare -a all_ws=()
+
+while IFS="$TAB" read -r wid windex wpath ws_name wact wlast; do
+    if [[ -z "$wid" ]]; then continue; fi
+    ws=""
+    if [[ -n "$ws_name" ]]; then
+        ws="$ws_name"
+    else
+        ws=$(ws_resolve_name_simple "$wpath")
+    fi
+
+    win_exists["$wid"]=1
+    win_ws["$wid"]="$ws"
+
+    wscore="${wlast:-0}"
+    if [[ -z "$wscore" || "$wscore" -le 0 ]]; then
+        wscore="${wact:-0}"
+    fi
+
+    if [[ -z "${ws_max_score[$ws]}" ]] || (( wscore > ws_max_score[$ws] )); then
+        ws_max_score["$ws"]="$wscore"
+        ws_mru_wid["$ws"]="$wid"
+    fi
+
+    if [[ -z "${seen_ws_first_wid[$ws]}" ]]; then
+        seen_ws_first_wid["$ws"]="$wid"
+        all_ws+=("$ws")
+    fi
+done <<< "$raw"
+
+idx=$(( target_num - 1 ))
+if (( idx < 0 || idx >= ${#all_ws[@]} )); then
+    exit 0
+fi
+
+target_ws="${all_ws[$idx]}"
+target_wid=""
+
+saved_wid=$(tmux show-option -t "$current_sess" -qv "@last_win_for_${target_ws}" 2>/dev/null)
+if [[ -z "$saved_wid" ]]; then
+    saved_wid=$(tmux show-option -gv "@last_win_for_${target_ws}" 2>/dev/null)
+fi
+
+if [[ -n "$saved_wid" && -n "${win_exists[$saved_wid]}" && "${win_ws[$saved_wid]}" == "$target_ws" ]]; then
+    target_wid="$saved_wid"
+elif [[ -n "${ws_mru_wid[$target_ws]}" ]]; then
+    target_wid="${ws_mru_wid[$target_ws]}"
+else
+    target_wid="${seen_ws_first_wid[$target_ws]}"
+fi
+
+if [[ -n "$target_wid" ]]; then
+    tmux select-window -t "$target_wid"
+    ~/.local/bin/track-active-window "$current_sess" >/dev/null 2>&1
+fi

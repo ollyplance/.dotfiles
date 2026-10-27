@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Blocks commits that would leak work-internal paths/URLs into this public-ish repo.
+# Bypass (only if you are sure): git commit --no-verify
+pattern='/google/(src|data|bin)|google3|sso://|corp\.google\.com|googlesource\.com|googleplex|/usr/local/google|citc|ciderlsp|nvgoog|gcert|jjd |go/[a-z]'
+hits=$(git diff --cached -U0 --diff-filter=ACM -- . ':!.githooks' ':!.p10k.zsh' | grep -E '^\+' | grep -v '^+++' | grep -inE "$pattern")
+if [[ -n "$hits" ]]; then
+  echo "pre-commit: possible work-internal content staged (put it in ~/.dotfiles-corp instead):" >&2
+  echo "$hits" | head -20 >&2
+  exit 1
+fi

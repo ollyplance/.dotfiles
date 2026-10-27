@@ -1,0 +1,8 @@
+# Initial configuration
+data.location=~/.task
+uda.gtaskid.type=string
+uda.gtaskid.label=GoogleTaskID
+uda.gtaskaccount.type=string
+uda.gtaskaccount.label=Account
+uda.todoistid.type=string
+uda.todoistid.label=TodoistID

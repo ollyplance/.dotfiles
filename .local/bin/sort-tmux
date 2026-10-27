@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+# --- ULTIMATE FLUID SORTING ENGINE (STRICT CONTIGUOUS CLUSTERING) ---
+# Guarantees each workspace has exactly one contiguous group of windows.
+# Preserves internal tab order when inserting new tabs.
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+current_sess="${1:-$(tmux display-message -p '#{session_id}')}"
+
+if [[ -z "$current_sess" ]]; then
+    exit 0
+fi
+
+get_workspace_meta() {
+    local path="$1"
+    local key=""
+    local name=""
+    local pretty=""
+    local color=""
+    local ws
+
+    # Special workspace roots (e.g. cloud checkouts) come from the optional hook
+    if ws=$(ws_special_name "$path"); then
+        key="special:${ws}"
+        name="${ws}"
+        pretty="${WS_SPECIAL_PREFIX}${ws}"
+        color=$(ws_color "$ws")
+    elif [[ "$path" == "$HOME"* ]]; then
+        local repo_name
+        if repo_name=$(ws_git_root_name "$path"); then
+            key="git:${repo_name}"
+            name="${repo_name}"
+            pretty="${repo_name}"
+            color=$(ws_color "$repo_name")
+        else
+            key="home:~"
+            name="~"
+            pretty="~"
+            color="#89b4fa"
+        fi
+    else
+        local base="${path##*/}"
+        key="dir:${base}"
+        name="${base:-/}"
+        pretty="${base:-/}"
+        color="#89b4fa"
+    fi
+
+    echo "${key}	${name}	${pretty}	${color}"
+}
+
+# Step 1: Scan all windows in session ordered by current window index
+win_data=$(tmux list-windows -t "$current_sess" -F '#{window_id}	#{window_index}	#{pane_current_path}	#{@initial_path}' | sort -k2,2n)
+
+declare -A cluster_last_wid=()
+declare -A cluster_finished=()
+prev_key=""
+
+while IFS=$'\t' read -r wid windex wpath winit; do
+    if [[ -z "$wid" ]]; then continue; fi
+    effective_path="$wpath"
+    if [[ -n "$winit" && ( "$wpath" == "$HOME" || -z "$wpath" ) && "$winit" != "$HOME" ]]; then
+        effective_path="$winit"
+    fi
+    IFS=$'\t' read -r wkey wname wpretty wcolor <<< "$(get_workspace_meta "$effective_path")"
+
+    # Detect when previous workspace closed off
+    if [[ -n "$prev_key" && "$wkey" != "$prev_key" ]]; then
+        cluster_finished["$prev_key"]=1
+    fi
+
+    # Only pull this window into the previous cluster if that cluster was already FINISHED (separated by another workspace)
+    if [[ -n "${cluster_finished[$wkey]}" ]]; then
+        last_wid="${cluster_last_wid[$wkey]}"
+        if [[ -n "$last_wid" && "$last_wid" != "$wid" ]]; then
+            tmux move-window -s "$wid" -a -t "$last_wid" 2>/dev/null
+        fi
+    fi
+
+    cluster_last_wid["$wkey"]="$wid"
+    prev_key="$wkey"
+done <<< "$win_data"
+
+# Compact any index gaps
+tmux move-window -r
+
+# Step 2: Apply group metadata to the resulting contiguous layout
+final_layout=$(tmux list-windows -t "$current_sess" -F '#{window_index}	#{pane_current_path}	#{window_id}	#{@initial_path}' | sort -k1,1n)
+
+mapfile -t windows <<< "$final_layout"
+count=${#windows[@]}
+
+declare -a tmux_cmds=()
+declare -a keys=()
+declare -a names=()
+declare -a pretties=()
+declare -a win_colors=()
+declare -a wids=()
+
+for (( i=0; i<count; i++ )); do
+    IFS=$'\t' read -r windex wpath wid winit <<< "${windows[i]}"
+    effective_path="$wpath"
+    if [[ -n "$winit" && ( "$wpath" == "$HOME" || -z "$wpath" ) && "$winit" != "$HOME" ]]; then
+        effective_path="$winit"
+    fi
+    IFS=$'\t' read -r wkey wname wpretty wcolor <<< "$(get_workspace_meta "$effective_path")"
+    wids+=("$wid")
+    keys+=("$wkey")
+    names+=("$wname")
+    pretties+=("$wpretty")
+    win_colors+=("$wcolor")
+done
+
+group_idx=1
+for (( i=0; i<count; i++ )); do
+    wid="${wids[i]}"
+    wkey="${keys[i]}"
+    wname="${names[i]}"
+    wpretty="${pretties[i]}"
+    wcolor="${win_colors[i]}"
+
+    is_start=0
+    if (( i == 0 )) || [[ "$wkey" != "${keys[i-1]}" ]]; then
+        is_start=1
+        group_idx=1
+    fi
+
+    is_sep=0
+    if (( i < count - 1 )) && [[ "$wkey" != "${keys[i+1]}" ]]; then
+        is_sep=1
+    fi
+
+    tmux_cmds+=(set-option -w -t "$wid" @is_group_start "$is_start" \;)
+    tmux_cmds+=(set-option -w -t "$wid" @is_group_sep "$is_sep" \;)
+    tmux_cmds+=(set-option -w -t "$wid" @workspace_name "$wname" \;)
+    tmux_cmds+=(set-option -w -t "$wid" @pretty_path "$wpretty" \;)
+    tmux_cmds+=(set-option -w -t "$wid" @group_color "$wcolor" \;)
+    tmux_cmds+=(set-option -w -t "$wid" @group_index "$group_idx" \;)
+
+    group_idx=$(( group_idx + 1 ))
+done
+
+if [[ ${#tmux_cmds[@]} -gt 0 ]]; then
+    tmux "${tmux_cmds[@]}"
+fi
+
+~/.local/bin/track-active-window "$current_sess" >/dev/null 2>&1

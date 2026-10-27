@@ -1,0 +1,22 @@
+# Air-gap safety protection: Explicitly forbid all corporate local configs
+.*.local
+.zshrc.local
+.tmux.conf.local
+.gitconfig.local
+*.bak
+*.bak.*
+
+# Hard-ban Neovim internal/corporate override folder (lives in ~/.dotfiles-corp)
+.config/nvim/lua/corp
+.config/nvim/lua/plugins/corp
+
+# jj colocated repo metadata
+.jj/
+
+# Temporary / Runtime artifacts
+*.swp
+*~
+.DS_Store
+.env
+node_modules/
+.python-version

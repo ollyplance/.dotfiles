@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+VENV_PYTHON="$HOME/.config/nexus-tasks/venv/bin/python3"
+ENGINE="$HOME/.config/nexus-tasks/todoist_sync.py"
+
+if [[ ! -f "$VENV_PYTHON" ]]; then
+    echo "Error: Python VirtualEnv missing!"
+    exit 1
+fi
+
+# Prevent infinite recursion loop from triggering our own hooks!
+export NEXUS_SYNC_ACTIVE=1
+
+exec "$VENV_PYTHON" "$ENGINE" "$@"

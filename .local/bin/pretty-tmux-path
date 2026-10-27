@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Feed pretty paths and live JJ revisions to the tmux status bar
+
+path="$1"
+if [[ -z "$path" ]]; then
+    exit 0
+fi
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+# If inside a special workspace root (defined by the optional tmux-ws hook)
+if ws=$(ws_special_name "$path"); then
+    color=$(ws_color "$ws")
+    
+    # 2-second caching to guarantee sub-millisecond status bar redraws
+    cache_dir="/tmp/tmux-jj-${USER:-$(id -un)}"
+    mkdir -p "$cache_dir" 2>/dev/null
+    cache_file="${cache_dir}/${ws}.cache"
+    now=$(date +%s)
+    
+    if [[ -f "$cache_file" ]]; then
+        mtime=$(ws_file_mtime "$cache_file")
+        if [[ -n "$mtime" ]] && (( now - mtime < 2 )); then
+            cat "$cache_file"
+            exit 0
+        fi
+    fi
+    
+    result=""
+    raw=$(ws_jj_info "$path")
+    if [[ -n "$raw" ]]; then
+        IFS=$'\t' read -r rev conflict desc <<< "$raw"
+        conflict_badge=""
+        if [[ "$conflict" == "CONFLICT" ]]; then
+            conflict_badge=" #[fg=#f38ba8,bold][CONFLICT]"
+        fi
+        if [[ -n "$desc" ]]; then
+            if [[ ${#desc} -gt 32 ]]; then
+                desc="${desc:0:29}..."
+            fi
+            result="#[fg=${color},bold]${WS_SPECIAL_PREFIX}${ws} #[fg=#a6e3a1]@ ${rev}${conflict_badge} #[fg=#a6adc8](${desc})"
+        else
+            result="#[fg=${color},bold]${WS_SPECIAL_PREFIX}${ws} #[fg=#a6e3a1]@ ${rev}${conflict_badge}"
+        fi
+    fi
+    
+    if [[ -z "$result" ]]; then
+        result="#[fg=${color},bold]${WS_SPECIAL_PREFIX}${ws}"
+    fi
+    
+    echo "$result" > "$cache_file" 2>/dev/null
+    echo "$result"
+    exit 0
+fi
+
+# Regular paths
+pretty="$path"
+if [[ "$path" == "$HOME"* ]]; then
+    pretty="~${path#$HOME}"
+fi
+
+# Check for Git branch
+git_info=""
+cur="$path"
+found_git=0
+while [[ -n "$cur" && "$cur" != "/" ]]; do
+    if [[ -d "$cur/.git" ]]; then
+        found_git=1
+        break
+    fi
+    cur="${cur%/*}"
+done
+
+if [[ $found_git -eq 1 ]]; then
+    branch=$(cd "$path" 2>/dev/null && git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
+    if [[ -n "$branch" ]]; then
+        git_info=" #[fg=#a6e3a1](${branch})"
+    fi
+fi
+
+echo "#[fg=#89b4fa,bold]${pretty}${git_info}"

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Script to print GKE context in a pretty format for the tmux status bar.
+# It dynamically queries the active pane's environment to respect pane-local KUBECONFIG overrides.
+
+# Get pane ID from arguments (defaulting to query via tmux if not passed)
+active_pane="${1:-$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)}"
+
+local_pane_id="${active_pane//%/}"
+if [ -n "$local_pane_id" ] && [ -f "/tmp/kubeconfig-tmux-${local_pane_id}" ]; then
+  export KUBECONFIG="/tmp/kubeconfig-tmux-${local_pane_id}"
+fi
+
+context=$(kubectl config current-context 2>/dev/null || true)
+if [ -z "$context" ]; then
+  echo ""
+  exit 0
+fi
+
+if [[ "$context" =~ ^gke_([^_]+)_([^_]+)_(.+)$ ]]; then
+  project="${BASH_REMATCH[1]}"
+  zone="${BASH_REMATCH[2]}"
+  cluster="${BASH_REMATCH[3]}"
+  # Format with Catppuccin-like colors
+  echo "#[fg=#89b4fa,bold]$cluster#[fg=#585b70]/#[fg=#fab387]$project#[fg=#585b70]/#[fg=#f9e2af]$zone #[fg=#45475a]│ "
+else
+  echo "#[fg=#89b4fa,bold]$context #[fg=#45475a]│ "
+fi

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+
+# --- TAB-MUX: Workspace-Scoped Tab Switcher (FZF) ---
+# Filters tabs strictly within the active workspace group.
+# Displays relative group index, window name, and active indicator.
+
+current_wid=$(tmux display-message -p '#{window_id}')
+current_ws=$(tmux display-message -p '#{@workspace_name}')
+current_path=$(tmux display-message -p '#{pane_current_path}')
+
+if [[ -z "$current_wid" ]]; then
+    exit 0
+fi
+
+# Fetch windows in the current session
+# Format: wid | group_idx | win_name | ws_name | is_active | path
+raw_windows=$(tmux list-windows -F '#{window_id}	#{@group_index}	#{window_name}	#{@workspace_name}	#{window_active}	#{pane_current_path}')
+
+if [[ -z "$raw_windows" ]]; then
+    exit 0
+fi
+
+lines=""
+while IFS=$'\t' read -r wid gidx wname ws wact wpath; do
+    # Match workspace group
+    matched=0
+    if [[ -n "$current_ws" && "$ws" == "$current_ws" ]]; then
+        matched=1
+    elif [[ -z "$current_ws" && "$wpath" == "$current_path" ]]; then
+        matched=1
+    fi
+
+    if [[ $matched -eq 1 ]]; then
+        idx="${gidx:-?}"
+        status_marker=" "
+        if [[ "$wact" -eq 1 ]]; then
+            status_marker="▶"
+        fi
+
+        # Pretty display: Tab [1]  AI: myrepo  (current)
+        display_str=$(printf "%s Tab %-2s  %-25s" "$status_marker" "[$idx]" "$wname")
+        if [[ "$wact" -eq 1 ]]; then
+            display_str="${display_str}  [active]"
+        fi
+
+        lines+="${display_str}	${wid}"$'\n'
+    fi
+done <<< "$raw_windows"
+
+if [[ -z "$lines" ]]; then
+    exit 0
+fi
+
+ws_label="${current_ws:-$(basename "$current_path")}"
+
+selected=$(echo -ne "$lines" | fzf \
+  --reverse \
+  --delimiter=$'\t' \
+  --with-nth=1 \
+  --header="Workspace Tabs: [${ws_label}]" \
+  --prompt="Switch Tab > " \
+  --bind 'ctrl-j:down,ctrl-k:up')
+
+if [[ -z "$selected" ]]; then
+    exit 0
+fi
+
+target_wid=$(echo "$selected" | cut -f2)
+if [[ -n "$target_wid" ]]; then
+    tmux select-window -t "$target_wid"
+fi

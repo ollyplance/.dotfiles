@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+--- ADVANCED AI CODE CLIPBOARD & EXTRACTOR ---
+Extracts, previews, and copies code blocks from the AI agent session
+belonging to the CURRENT active tab/pane.
+
+The latest AI response is provided by an optional "source" hook executable
+(~/.local/bin/copy-ai-code-source [PANE] [PID]) that prints JSON:
+    {"found": true, "id": "<session id>", "text": "<latest response markdown>"}
+Without a hook (or when it reports found=false) code blocks are scraped from the
+tmux pane scrollback instead.
+Supports multi-protocol clipboard delivery (OSC-52, tmux buffer, xclip, wl-copy).
+Includes live FZF preview, tool call extraction, and screen capture fallback.
+"""
+
+import os
+import sys
+import json
+import re
+import glob
+import base64
+import tempfile
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+LOG_FILE = "/tmp/copy_ai_debug.log"
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def copy_to_clipboard(text):
+    """Delivers text to the clipboard with multi-protocol redundancy."""
+    methods_used = []
+
+    # 1. Native Tmux set-buffer -w (Built-in OSC-52 terminal forwarder)
+    if "TMUX" in os.environ:
+        try:
+            res = subprocess.run(
+                ['tmux', 'set-buffer', '-w', '--', text],
+                capture_output=True
+            )
+            if res.returncode == 0:
+                methods_used.append("tmux-osc52")
+        except Exception:
+            pass
+
+    # 2. Raw DCS OSC-52 Passthrough directly to pane TTY and client TTY
+    try:
+        b64_data = base64.b64encode(text.encode('utf-8')).decode('utf-8')
+        osc_tmux = f"\033Ptmux;\033\033]52;c;{b64_data}\007\033\\"
+        for tty_spec in ['#{client_tty}', '#{pane_tty}']:
+            try:
+                tty = subprocess.check_output(
+                    ['tmux', 'display-message', '-p', tty_spec],
+                    stderr=subprocess.DEVNULL
+                ).decode().strip()
+                if tty and os.path.exists(tty):
+                    with open(tty, 'w') as fp:
+                        fp.write(osc_tmux)
+                    methods_used.append(f"raw-tty({tty_spec})")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3. Dedicated osc52_copy.sh helper
+    osc52_script = os.path.expanduser("~/.local/bin/osc52_copy.sh")
+    if os.path.exists(osc52_script) and os.access(osc52_script, os.X_OK):
+        try:
+            env = dict(os.environ)
+            env["NO_TMUX_TOAST"] = "1"
+            res = subprocess.run(
+                [osc52_script],
+                input=text.encode('utf-8'),
+                capture_output=True,
+                env=env
+            )
+            if res.returncode == 0:
+                methods_used.append("osc52_copy.sh")
+        except Exception:
+            pass
+
+    # 4. Standard X11 xclip (if DISPLAY is present)
+    if os.environ.get("DISPLAY"):
+        try:
+            p = subprocess.Popen(
+                ['xclip', '-selection', 'clipboard', '-i'],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            p.communicate(input=text.encode('utf-8'))
+            if p.returncode == 0:
+                methods_used.append("xclip")
+        except Exception:
+            pass
+
+    # 5. Wayland wl-copy (if WAYLAND_DISPLAY is present)
+    if os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            p = subprocess.Popen(
+                ['wl-copy'],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            p.communicate(input=text.encode('utf-8'))
+            if p.returncode == 0:
+                methods_used.append("wl-copy")
+        except Exception:
+            pass
+
+    # 6. macOS pbcopy (if running on Darwin)
+    try:
+        p = subprocess.Popen(
+            ['pbcopy'],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        p.communicate(input=text.encode('utf-8'))
+        if p.returncode == 0:
+            methods_used.append("pbcopy")
+    except Exception:
+        pass
+
+    return methods_used
+
+
+SOURCE_HOOK = os.path.expanduser("~/.local/bin/copy-ai-code-source")
+
+
+def get_ai_response(target_pane=None, target_pid=None):
+    """Asks the optional source hook for the latest AI response of the active tab/pane.
+
+    Returns (found, session_id, text).
+    """
+    if not (os.path.exists(SOURCE_HOOK) and os.access(SOURCE_HOOK, os.X_OK)):
+        return False, None, ""
+    cmd = [SOURCE_HOOK]
+    if target_pane:
+        cmd.append(str(target_pane))
+        if target_pid:
+            cmd.append(str(target_pid))
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+        data = json.loads(out) if out.strip() else {}
+    except Exception as e:
+        log(f"Source hook failed: {e}")
+        return False, None, ""
+    return bool(data.get("found")), data.get("id"), (data.get("text") or "")
+
+
+def extract_code_blocks_from_text(content, source_label="AI Response"):
+    """Robustly extracts markdown fenced code blocks with any language tag."""
+    blocks = []
+    # Match fenced code blocks starting on their own line with optional leading whitespace
+    pattern = r"(?ms)^[ \t]*```+([a-zA-Z0-9_\+\-\#\.]*)[^\n]*\n(.*?)^[ \t]*```+"
+    matches = re.findall(pattern, content)
+    for lang, code in matches:
+        clean = code.strip()
+        if clean:
+            blocks.append({
+                "lang": lang.strip() if lang.strip() else "text",
+                "code": clean,
+                "source": source_label,
+            })
+    return blocks
+
+
+def extract_from_screen(target_pane=None):
+    """Captures code blocks currently visible on the active tmux pane scrollback."""
+    blocks = []
+    if "TMUX" not in os.environ:
+        return blocks
+    try:
+        cmd = ['tmux', 'capture-pane']
+        if target_pane:
+            cmd.extend(['-t', str(target_pane)])
+        cmd.extend(['-p', '-S', '-300'])
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+        blocks = extract_code_blocks_from_text(out, source_label="Screen Capture")
+    except Exception:
+        pass
+    return blocks
+
+
+def show_toast(title, subtitle="Ready to Cmd+V", color="#a6e3a1"):
+    """No-op: silent clipboard copy without popups or status-bar text."""
+    pass
+
+
+def prompt_selection_with_preview(blocks, full_response="", conv_id=None):
+    """Fires up FZF with a live side-by-side preview of every code block via clean file redirection."""
+    temp_dir = tempfile.mkdtemp(prefix="copy_ai_")
+
+    try:
+        menu_items = []
+        file_map = {}
+
+        for i, b in enumerate(blocks):
+            key = f"block_{i + 1}"
+            code_file = os.path.join(temp_dir, f"{key}.txt")
+            with open(code_file, 'w', encoding='utf-8') as f:
+                f.write(b["code"])
+            file_map[key] = b["code"]
+
+            code_lines = b["code"].splitlines()
+            first_line = code_lines[0][:45] if code_lines else ""
+            line_cnt = len(code_lines)
+            byte_cnt = len(b["code"].encode('utf-8'))
+            size_str = f"{byte_cnt} B" if byte_cnt < 1024 else f"{byte_cnt / 1024:.1f} KB"
+
+            menu_items.append(
+                f"[{i + 1}]\t[{b['lang']:<8}]\t({line_cnt:>2} lines, {size_str:>7})\t{first_line}\t{b['source']}\t{key}"
+            )
+
+        if len(blocks) > 1:
+            all_code = "\n\n".join(b["code"] for b in blocks)
+            all_file = os.path.join(temp_dir, "block_all.txt")
+            with open(all_file, 'w', encoding='utf-8') as f:
+                f.write(all_code)
+            file_map["block_all"] = all_code
+            menu_items.append(f"[ALL]\t[all]\t({len(blocks)} blocks combined)\tCopy all code blocks\tAggregate\tblock_all")
+
+        if full_response:
+            full_file = os.path.join(temp_dir, "block_full.txt")
+            with open(full_file, 'w', encoding='utf-8') as f:
+                f.write(full_response)
+            file_map["block_full"] = full_response
+            menu_items.append(f"[FULL]\t[markdown]\t({len(full_response.splitlines())} lines)\tCopy full AI markdown response\tTranscript\tblock_full")
+
+        input_data = "\n".join(menu_items)
+
+        items_file = os.path.join(temp_dir, "items.tsv")
+        selected_file = os.path.join(temp_dir, "selected.tsv")
+        with open(items_file, 'w', encoding='utf-8') as f:
+            f.write(input_data + "\n")
+
+        preview_cmd = f"cat -n {temp_dir}/{{6}}.txt 2>/dev/null || cat {temp_dir}/{{6}}.txt"
+
+        cid_header = f" [{conv_id[:8]}...]" if conv_id else ""
+        header_str = f"📦 AI Code Extractor{cid_header} (Enter: Copy | Esc: Cancel)"
+
+        fzf_cmd = (
+            f"fzf --reverse --delimiter=$'\\t' --with-nth=1,2,3,4,5 "
+            f"--header='{header_str}' --prompt='Select Block > ' "
+            f"--preview='{preview_cmd}' --preview-window='right:60%:wrap' "
+            f"--bind='ctrl-j:down,ctrl-k:up' < '{items_file}' > '{selected_file}'"
+        )
+
+        log(f"Launching FZF: {len(menu_items)} items")
+        res = subprocess.run(fzf_cmd, shell=True, executable="/bin/bash")
+        log(f"FZF exit code: {res.returncode}")
+
+        if res.returncode != 0:
+            if res.returncode not in (1, 130):
+                log(f"FZF unexpected failure rc={res.returncode}")
+                print(f"\n[ERROR] FZF failed with code {res.returncode}")
+                try:
+                    input("\nPress Enter to close...")
+                except Exception:
+                    pass
+            return None, None
+
+        if not os.path.exists(selected_file):
+            return None, None
+
+        with open(selected_file, 'r', encoding='utf-8') as f:
+            selected_line = f.read().strip()
+
+        if not selected_line:
+            return None, None
+
+        parts = selected_line.split("\t")
+        if len(parts) >= 6:
+            block_key = parts[5].strip()
+            return file_map.get(block_key), parts[1].strip("[] ")
+
+    finally:
+        try:
+            for f in glob.glob(os.path.join(temp_dir, "*")):
+                os.remove(f)
+            os.rmdir(temp_dir)
+        except Exception:
+            pass
+
+    return None, None
+
+
+def main():
+    target_pane = None
+    target_pid = None
+
+    log(f"--- INVOKED with sys.argv={sys.argv} ---")
+
+    # Parse command line arguments
+    if len(sys.argv) > 1:
+        arg1 = sys.argv[1].strip("'\"")
+        # Ignore literal unexpanded tmux tokens
+        if arg1.startswith("#{") and arg1.endswith("}"):
+            arg1 = ""
+        if arg1.startswith("%") or (arg1.isdigit() and len(arg1) <= 8):
+            target_pane = arg1
+            if len(sys.argv) > 2:
+                arg2 = sys.argv[2].strip("'\"")
+                if arg2.isdigit():
+                    target_pid = arg2
+            log(f"Parsed target_pane={target_pane}, target_pid={target_pid}")
+        elif arg1 and not arg1.startswith("-"):
+            # Only treat as direct text copy if explicitly passed real text
+            text = sys.argv[1]
+            methods = copy_to_clipboard(text)
+            show_toast("Copied to Mac Clipboard", f"{len(text.splitlines())} line(s) • {len(text)} chars (Cmd+V)")
+            print(f"✅ Copied {len(text)} characters ({len(text.splitlines())} lines) via {', '.join(methods)}!")
+            sys.exit(0)
+
+    # 1. Resolve the latest AI response specifically for the active tab/pane
+    found, conv_id, full_response = get_ai_response(target_pane, target_pid)
+    log(f"Source hook found={found}, conv_id={conv_id}, full_response_len={len(full_response)}")
+
+    blocks = []
+    if found and full_response:
+        blocks = extract_code_blocks_from_text(full_response, source_label="AI Response")
+        log(f"Extracted {len(blocks)} blocks from AI response")
+
+    # 2. Only fallback to screen capture if no AI session was found at all
+    if not found and not blocks:
+        blocks = extract_from_screen(target_pane)
+        log(f"Screen capture fallback yielded {len(blocks)} blocks")
+
+    if not blocks and not full_response:
+        log("No blocks found anywhere!")
+        print("┌────────────────────────────────────────────────────────┐")
+        print("│ ❌ No code blocks found in this tab's AI session.       │")
+        if conv_id:
+            print(f"│ 🧠 Tab Session: {conv_id[:20]}...                     │")
+        print("└────────────────────────────────────────────────────────┘")
+        show_toast("No Code Blocks Found", "Nothing in this tab's session", "#f38ba8")
+        try:
+            input("\nPress Enter to close...")
+        except Exception:
+            pass
+        sys.exit(0)
+
+    # ALWAYS open the interactive FZF preview picker!
+    chosen_code, chosen_lang = prompt_selection_with_preview(blocks, full_response, conv_id)
+    if not chosen_code:
+        log("User cancelled selection.")
+        sys.exit(0)
+
+    # Clean and copy
+    clean_code = chosen_code.strip()
+    methods = copy_to_clipboard(clean_code)
+    log(f"Delivered {len(clean_code)} chars via {methods}")
+
+    lines = clean_code.splitlines()
+    line_count = len(lines)
+    char_count = len(clean_code)
+
+    # Floating toast notification popup
+    lang_tag = f" ({chosen_lang})" if chosen_lang else ""
+    show_toast(f"Copied AI Block{lang_tag}", f"{line_count} line(s) • {char_count} chars (Cmd+V)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log(f"CRITICAL EXCEPTION in main: {e}")
+        show_toast("Copy Error", "See /tmp/copy_ai_debug.log", "#f38ba8")
+        print(f"\n[ERROR] copy-ai-code failed: {e}")
+        print("See /tmp/copy_ai_debug.log for details.")
+        try:
+            input("\nPress Enter to close...")
+        except Exception:
+            pass
+        sys.exit(1)

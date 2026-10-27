@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+# --- TOGGLE-SCRATCH: Tactical Floating Scratchpad ---
+# Creates persistent scratch session if needed and opens floating popup.
+
+# Ensure scratch session exists with standard prefix C-h
+tmux new-session -d -s scratch 2>/dev/null
+tmux set-option -t scratch prefix C-h 2>/dev/null
+
+# Open floating popup attached to the persistent scratch session
+tmux display-popup -E -w 85% -h 75% "tmux attach-session -t scratch"

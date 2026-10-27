@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+# Cycle strictly within the active workspace/directory cluster
+direction="${1:-next}"
+
+current_win=$(tmux display-message -p '#{window_id}')
+current_ws=$(tmux display-message -p '#{@workspace_name}')
+current_path=$(tmux display-message -p '#{pane_current_path}')
+
+if [[ -z "$current_win" ]]; then
+    exit 0
+fi
+
+# Find all windows in the current session belonging to this workspace cluster
+if [[ -n "$current_ws" ]]; then
+    raw_matches=$(tmux list-windows -F '#{window_index}	#{window_id}	#{@workspace_name}' | \
+      sort -n | \
+      awk -F'\t' -v m="$current_ws" '$3 == m' | \
+      cut -f2)
+else
+    raw_matches=$(tmux list-windows -F '#{window_index}	#{window_id}	#{pane_current_path}' | \
+      sort -n | \
+      awk -F'\t' -v m="$current_path" '$3 == m' | \
+      cut -f2)
+fi
+
+IFS=$'\n' read -d '' -r -a win_list <<< "$raw_matches"
+count=${#win_list[@]}
+
+# If only 1 window exists in this workspace, no hopping possible
+if [[ $count -le 1 ]]; then
+    exit 0
+fi
+
+# Locate current position in the workspace ring
+curr_pos=-1
+for i in "${!win_list[@]}"; do
+    if [[ "${win_list[$i]}" == "$current_win" ]]; then
+        curr_pos=$i
+        break
+    fi
+done
+
+if [[ $curr_pos -eq -1 ]]; then
+    next_win="${win_list[0]}"
+elif [[ "$direction" == "prev" ]]; then
+    next_idx=$(( (curr_pos - 1 + count) % count ))
+    next_win="${win_list[$next_idx]}"
+else
+    next_idx=$(( (curr_pos + 1) % count ))
+    next_win="${win_list[$next_idx]}"
+fi
+
+if [[ -n "$next_win" ]]; then
+    tmux select-window -t "$next_win"
+    ~/.local/bin/track-active-window "$next_win" >/dev/null 2>&1
+fi

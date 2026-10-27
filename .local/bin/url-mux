@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+# --- URL-MUX: Fuzzy link picker for the current pane ---
+# Optional hook ~/.local/bin/url-mux-hook.sh may define:
+#   URL_MUX_EXTRA_RE        -> extra grep -E alternative (e.g. shortlinks)
+#   url_mux_expand LINK     -> echo the full URL for a matched extra link
+
+URL_MUX_EXTRA_RE=""
+url_mux_expand() { echo "$1"; }
+hook="$HOME/.local/bin/url-mux-hook.sh"
+if [[ -r "$hook" ]]; then
+    # shellcheck source=/dev/null
+    . "$hook"
+fi
+
+# 1. Scrape CURRENT visual viewport scrollback buffer for text
+raw_text=$(tmux capture-pane -p -S -100)
+
+# 2. Highly precise regex pattern matching for ultimate discovery:
+#    a) Full HTTP/HTTPS URLs
+#    b) Anything matched by the hook's URL_MUX_EXTRA_RE
+# Using strict positive matchers to absolutely guarantee no trailing garbage!
+url_re="https?://[-a-zA-Z0-9@:%._\+~#=/?&]+"
+if [[ -n "$URL_MUX_EXTRA_RE" ]]; then
+    url_re="${url_re}|${URL_MUX_EXTRA_RE}"
+fi
+urls=$(echo "$raw_text" | grep -oE "$url_re" | sort | uniq)
+
+if [[ -z "$urls" ]]; then
+    # Unified Status Bar Alert! (Red warning, no emoji, 5 sec)
+    ( tmux set-option -g @status_info "#[fg=red,bold]NO LINKS FOUND " ; sleep 5 ; tmux set-option -g @status_info "" ) & disown
+    exit 0
+fi
+
+# 3. Present clickable links in dynamic fuzzy picker
+selected=$(echo -e "$urls" | fzf \
+  --reverse \
+  --header="🔗 Captured Screen Links" \
+  --prompt="Open Link > " \
+  --bind 'ctrl-j:down,ctrl-k:up')
+
+if [[ -z "$selected" ]]; then
+    exit 0
+fi
+
+# 4. Sanitize and teleport directly to local clipboard using our custom TTY bypass!
+full_target="$selected"
+if [[ ! "$selected" =~ ^https?:// ]]; then
+    full_target=$(url_mux_expand "$selected")
+fi
+
+# Feed into our indestructible clipboard pipeline!
+~/.local/bin/copy-ai-code "$full_target"

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+# --- SMART-NEW-TAB: Context-Aware Workspace Tab Creator ---
+# Creates a new tab immediately next to the current tab within the same workspace,
+# or cleanly appends to the ~ workspace when target is $HOME.
+# Never breaks workspace clustering or causes duplicate header badges.
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+target_dir="$1"
+
+curr_sess=$(tmux display-message -p '#{session_id}')
+curr_wid=$(tmux display-message -p '#{window_id}')
+curr_path=$(tmux display-message -p '#{pane_current_path}')
+curr_ws=$(tmux display-message -p '#{@workspace_name}')
+curr_color=$(tmux display-message -p '#{@group_color}')
+curr_pretty=$(tmux display-message -p '#{@pretty_path}')
+
+# If no target specified, use current pane path
+if [[ -z "$target_dir" ]]; then
+    target_dir="$curr_path"
+fi
+target_dir="${target_dir:-$HOME}"
+
+target_ws=$(ws_resolve_name "$target_dir")
+new_wid=""
+
+if [[ "$target_ws" != "$curr_ws" ]]; then
+    # Opening a tab in a different workspace (~ or another special/git workspace)
+    last_ws_wid=$(tmux list-windows -t "$curr_sess" -F '#{window_id}	#{@workspace_name}' | awk -F'\t' -v ws="$target_ws" '$2 == ws {id=$1} END {print id}')
+    if [[ -n "$last_ws_wid" ]]; then
+        new_wid=$(tmux new-window -a -t "$last_ws_wid" -c "$target_dir" -P -F '#{window_id}')
+    else
+        new_wid=$(tmux new-window -t "$curr_sess" -c "$target_dir" -P -F '#{window_id}')
+    fi
+    tmux set-option -w -t "$new_wid" @workspace_name "$target_ws"
+    tmux set-option -w -t "$new_wid" @initial_path "$target_dir"
+else
+    # Sibling tab in current workspace
+    new_wid=$(tmux new-window -a -t "$curr_wid" -c "$target_dir" -P -F '#{window_id}')
+    if [[ -n "$curr_ws" ]]; then
+        tmux set-option -w -t "$new_wid" @workspace_name "$curr_ws"
+        tmux set-option -w -t "$new_wid" @group_color "$curr_color"
+        tmux set-option -w -t "$new_wid" @pretty_path "$curr_pretty"
+        tmux set-option -w -t "$new_wid" @initial_path "$target_dir"
+    fi
+fi
+
+if [[ -n "$new_wid" ]]; then
+    ~/.local/bin/sort-tmux "$curr_sess"
+fi

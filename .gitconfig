@@ -1,0 +1,37 @@
+[core]
+	editor = nvim
+[user]
+	name = Olly Lance
+	email = ollyplance@gmail.com
+[commit]
+	gpgsign = false
+[safe]
+    barerepository=all
+    directory=*
+[secrets]
+	allowed = [a-zA-Z0-9]+-placeholder
+[alias]
+    a = commit --amend
+    allfiles = "!f() { git log --name-only --diff-filter=A --pretty=format: | sort -u; }; f"
+    cfg = config --list
+    changedfiles = "diff-tree --no-commit-id -r --name-only"
+    c = commit
+    co = checkout
+    cob = checkout -b
+    discard = reset HEAD --hard
+    discardchunk = checkout -p
+    ol = "log --all --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit"
+    others = "ls-files --others --ignored --exclude-from=.gitignore"
+    rmuntracked = clean -df
+    root = rev-parse --show-toplevel
+    s = status
+    searchfiles = "log --name-status --source --all -S"
+    searchtext = "!f() { git grep \"$*\" $(git rev-list --all); }; f"
+    uncommit = reset --soft HEAD^
+    unstage = reset HEAD --
+    wip = "!f() { git add . && git commit -m 'Work in progress'; }; f"
+
+[include]
+    path = ~/.gitconfig.local
+[init]
+	defaultRefFormat = files

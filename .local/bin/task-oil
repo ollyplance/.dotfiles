@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+VENV_PYTHON="$HOME/.config/nexus-tasks/venv/bin/python3"
+ENGINE="$HOME/.config/nexus-tasks/todoist_oil.py"
+
+if [[ ! -f "$VENV_PYTHON" ]]; then
+    echo "Error: Python VirtualEnv missing!"
+    exit 1
+fi
+
+
+# 1. Launch visual text-buffer editor
+"$VENV_PYTHON" "$ENGINE" "$@"
+
+# 2. Capture state code!
+STATUS=$?
+
+if [ "$STATUS" -eq 0 ]; then
+    # Redundant in the new Direct-Cloud Engine:
+    # tmux run-shell -b "$HOME/.local/bin/task-sync >/dev/null 2>&1"
+    echo "🌈 Done."
+elif [ "$STATUS" -eq 10 ]; then
+    echo "⏩ No changes detected."
+else
+    echo "⚠️ Aborted. Sync cancelled."
+    sleep 1 # short pause for error awareness
+fi
+
+# Instantly release!
+exit 0

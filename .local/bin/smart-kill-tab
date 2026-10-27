@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+# --- SMART-KILL-TAB: Context-Aware Tab Destroyer ---
+# When closing a tab, always stays within the current workspace if possible,
+# focusing the previous tab instead of jumping forward into the next workspace.
+
+current_wid=$(tmux display-message -p '#{window_id}')
+current_ws=$(tmux display-message -p '#{@workspace_name}')
+current_path=$(tmux display-message -p '#{pane_current_path}')
+
+if [[ -z "$current_wid" ]]; then
+    exit 0
+fi
+
+# Get list of window IDs strictly within the active workspace cluster
+if [[ -n "$current_ws" ]]; then
+    raw_matches=$(tmux list-windows -F '#{window_index}	#{window_id}	#{@workspace_name}' | \
+      sort -k1,1n | \
+      awk -F'\t' -v m="$current_ws" '$3 == m' | \
+      cut -f2)
+else
+    raw_matches=$(tmux list-windows -F '#{window_index}	#{window_id}	#{pane_current_path}' | \
+      sort -k1,1n | \
+      awk -F'\t' -v m="$current_path" '$3 == m' | \
+      cut -f2)
+fi
+
+IFS=$'\n' read -d '' -r -a win_list <<< "$raw_matches"
+count=${#win_list[@]}
+
+target_win=""
+curr_pos=-1
+for i in "${!win_list[@]}"; do
+    if [[ "${win_list[$i]}" == "$current_wid" ]]; then
+        curr_pos=$i
+        break
+    fi
+done
+
+if (( count > 1 )) && (( curr_pos != -1 )); then
+    if (( curr_pos > 0 )); then
+        # Prefer the previous tab in this workspace
+        target_win="${win_list[$(( curr_pos - 1 ))]}"
+    else
+        # If closing the first tab, go to the next tab in this workspace
+        target_win="${win_list[1]}"
+    fi
+fi
+
+# Switch focus before killing if a sister tab exists
+if [[ -n "$target_win" && "$target_win" != "$current_wid" ]]; then
+    tmux select-window -t "$target_win"
+fi
+
+# Kill the target window
+tmux kill-window -t "$current_wid"
+
+# Re-sort and re-index surviving tabs immediately
+~/.local/bin/sort-tmux

@@ -1,0 +1,11 @@
+#:schema https://docs.jj-vcs.dev/latest/config-schema.json
+[aliases]
+l = ["log", "-n", "10"]              # 'jj l' shows last 10
+lm = ["log", "-r", "mutable()"]      # 'jj lm' shows local mutable changes
+ls = ["log", "-r", "trunk()..@"]     # 'jj ls' shows current stack
+s = ["status"]
+
+[ui]
+default-command = "log"
+conflict-marker-style = "git"
+

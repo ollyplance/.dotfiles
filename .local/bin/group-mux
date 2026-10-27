@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+# --- GROUP-MUX: Jump to a project group (unique pane directory), then a tab within it ---
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+# 1. Scan all windows and filter down to only UNIQUE current directory paths
+raw_paths=$(tmux list-windows -a -F '#{pane_current_path}' | sort | uniq | sed '/^[[:space:]]*$/d')
+
+if [[ -z "$raw_paths" ]]; then
+    exit 0
+fi
+
+# 2. Iterate and dynamically transform raw system paths into user-friendly Semantic Labels
+formatted_rows=""
+while IFS= read -r path; do
+    if [[ -z "$path" ]]; then continue; fi
+    
+    pretty_label=$(echo "$path" | sed "s|$HOME|~|g")
+    
+    if special_ws=$(ws_special_name "$path"); then
+        pretty_label="${WS_SPECIAL_PREFIX}${special_ws}"
+    fi
+    
+    # Simple, foolproof tab delimiter. No manual padding, no glitchy bars!
+    formatted_rows+="${pretty_label}\t${path}\n"
+done <<< "$raw_paths"
+
+formatted_rows=$(echo -e "$formatted_rows" | sed '/^[[:space:]]*$/d')
+
+# 3. Launch picker showing only the beautiful dynamic labels!
+selected=$(echo -e "$formatted_rows" | fzf \
+  --reverse \
+  --delimiter=$'\t' \
+  --with-nth=1 \
+  --header="Select Project Group" \
+  --prompt="Jump to Group > " \
+  --bind 'ctrl-j:down,ctrl-k:up')
+
+if [[ -z "$selected" ]]; then
+    exit 0
+fi
+
+# 4. Parse the actual hidden path from column 2!
+actual_path=$(echo "$selected" | cut -f2)
+
+if [[ -z "$actual_path" ]]; then exit 0; fi
+
+# 5. Execute precise jump to that group cluster. 
+# Priority 1: Check active session first to prevent unnecessary context jumps!
+target_info=$(tmux list-windows -F '#{session_name}	#{window_index}	#{window_id}	#{pane_current_path}' | \
+  sort -t $'\t' -k2,2n | \
+  awk -F'\t' -v p="$actual_path" '$4 == p' | \
+  head -n 1)
+
+# Priority 2: Fall back to global search if group does not exist locally
+if [[ -z "$target_info" ]]; then
+    target_info=$(tmux list-windows -a -F '#{session_name}	#{window_index}	#{window_id}	#{pane_current_path}' | \
+      sort -t $'\t' -k2,2n | \
+      awk -F'\t' -v p="$actual_path" '$4 == p' | \
+      head -n 1)
+fi
+
+target_session=$(echo "$target_info" | cut -f1)
+target_win=$(echo "$target_info" | cut -f3)
+
+if [[ -n "$target_win" ]]; then
+    tmux select-window -t "$target_win"
+fi
+
+# Ensure we have a resolved session context for the sub-query
+if [[ -z "$target_session" ]]; then exit 0; fi
+
+# 6. Secondary Filter: Interactively resolve a specific tab within the selected session ONLY
+raw_group_windows=$(tmux list-windows -t "$target_session" -F '#{window_index}	#{window_name}	#{window_id}	#{pane_current_path}' | \
+    awk -F'\t' -v p="$actual_path" '$4 == p')
+
+# Count entries reliably
+num_windows=$(echo "$raw_group_windows" | grep -c .)
+
+# If only 1 window exists, they are already landed! Finish immediately.
+if [[ $num_windows -le 1 ]]; then
+    exit 0
+fi
+
+group_label=$(echo "$selected" | cut -f1)
+
+# Launch secondary precision picker
+selected_tab=$(echo -e "$raw_group_windows" | fzf \
+  --reverse \
+  --delimiter=$'\t' \
+  --with-nth=1,2 \
+  --header="Filter Tabs in: $group_label" \
+  --prompt="Select Tab (Esc to keep landing) > " \
+  --bind 'ctrl-j:down,ctrl-k:up')
+
+# User pressed Escape? No problem, script exits but window switch in step 5 remains active!
+if [[ -z "$selected_tab" ]]; then
+    exit 0
+fi
+
+# Parse the specific destination ID from column 3 and finalise navigation
+final_win_id=$(echo "$selected_tab" | cut -f3)
+if [[ -n "$final_win_id" ]]; then
+    tmux select-window -t "$final_win_id"
+fi

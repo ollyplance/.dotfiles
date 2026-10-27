@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+
+# --- WORKSPACE-MUX: MRU Workspace Switcher ---
+# Sorts workspaces by Most Recently Used (user focus), placing the active workspace at the bottom.
+# Supports instant 1-9 number key jumping matching the left-to-right top bar order.
+
+# shellcheck source=tmux-ws-lib.sh
+. "$HOME/.local/bin/tmux-ws-lib.sh" "$@"
+
+TAB=$'\t'
+current_sess="${1:-$(tmux display-message -p '#{session_id}')}"
+raw=$(tmux list-windows -t "$current_sess" -F "#{window_id}${TAB}#{window_index}${TAB}#{window_name}${TAB}#{pane_current_path}${TAB}#{@workspace_name}${TAB}#{window_activity}${TAB}#{window_active}${TAB}#{@win_last_used}" | sort -t"$TAB" -k2,2n)
+
+if [[ -z "$raw" ]]; then
+    exit 0
+fi
+
+current_ws=""
+declare -A seen_ws=()
+declare -A ws_tab_count=()
+declare -A ws_max_activity=()
+declare -A ws_mru_wid=()
+declare -A ws_mru_path=()
+declare -A ws_mru_idx=()
+declare -A win_exists=()
+declare -A win_path=()
+declare -A win_idx=()
+declare -A win_ws=()
+declare -A ws_bar_idx=()
+declare -A ws_num_to_wid=()
+declare -a all_ws=()
+
+while IFS="$TAB" read -r wid windex wname wpath ws_name wact wactive wlast; do
+    ws=""
+    if [[ -n "$ws_name" ]]; then
+        ws="$ws_name"
+    else
+        ws=$(ws_resolve_name_simple "$wpath")
+    fi
+
+    win_exists["$wid"]=1
+    win_path["$wid"]="$wpath"
+    win_idx["$wid"]="$windex"
+    win_ws["$wid"]="$ws"
+
+    if [[ "$wactive" -eq 1 ]]; then
+        current_ws="$ws"
+    fi
+
+    ws_tab_count["$ws"]=$(( ${ws_tab_count["$ws"]:-0} + 1 ))
+
+    # Prefer user-focus timestamp (@win_last_used) over background terminal output (window_activity)
+    wscore="${wlast:-0}"
+    if [[ -z "$wscore" || "$wscore" -le 0 ]]; then
+        wscore="${wact:-0}"
+    fi
+
+    if [[ -z "${ws_max_activity[$ws]}" ]] || (( wscore > ws_max_activity[$ws] )); then
+        ws_max_activity["$ws"]="$wscore"
+        ws_mru_wid["$ws"]="$wid"
+        ws_mru_path["$ws"]="$wpath"
+        ws_mru_idx["$ws"]="$windex"
+    fi
+
+    if [[ -z "${seen_ws[$ws]}" ]]; then
+        seen_ws["$ws"]="${wid}${TAB}${wpath}${TAB}${windex}"
+    fi
+
+    found=0
+    for w in "${all_ws[@]}"; do
+        if [[ "$w" == "$ws" ]]; then found=1; break; fi
+    done
+    if [[ $found -eq 0 ]]; then
+        all_ws+=("$ws")
+        ws_bar_idx["$ws"]=${#all_ws[@]}
+    fi
+done <<< "$raw"
+
+# Sort alternative workspaces by user-focus MRU descending (most recently focused first)
+prev_ws=$(tmux show-option -t "$current_sess" -qv @prev_workspace 2>/dev/null)
+
+declare -a other_ws=()
+for ws in "${all_ws[@]}"; do
+    if [[ "$ws" != "$current_ws" ]]; then
+        other_ws+=("$ws")
+    fi
+done
+
+sorted_others=($(
+    for ws in "${other_ws[@]}"; do
+        ws_used=$(tmux show-option -t "$current_sess" -qv "@ws_last_used_${ws}" 2>/dev/null)
+        prio=0
+        if [[ -n "$prev_ws" && "$ws" == "$prev_ws" ]]; then
+            prio=2
+        elif [[ -n "$ws_used" && "$ws_used" -gt 0 ]]; then
+            prio=1
+        fi
+        score="${ws_used:-${ws_max_activity[$ws]:-0}}"
+        echo "${prio} ${score} ${ws}"
+    done | sort -k1,1rn -k2,2rn | awk '{print $3}'
+))
+
+# Final order: alternative workspaces first, active workspace at bottom
+final_ws_order=("${sorted_others[@]}")
+if [[ -n "$current_ws" ]]; then
+    final_ws_order+=("$current_ws")
+fi
+
+CACHE_DIR="/tmp/tmux_workspace_cache_${USER:-$(id -un)}"
+mkdir -p "$CACHE_DIR" 2>/dev/null
+
+fetch_jj_info() {
+    local target_path="$1"
+    local cache_file="$2"
+    ws_jj_info "$target_path" > "$cache_file" || echo "" > "$cache_file"
+}
+
+formatted_lines=""
+for ws in "${final_ws_order[@]}"; do
+    # Resolve target window: prefer tracked last active window for this workspace if alive and still in this workspace
+    target_wid=""
+    saved_wid=$(tmux show-option -t "$current_sess" -qv "@last_win_for_${ws}" 2>/dev/null)
+    if [[ -z "$saved_wid" ]]; then
+        saved_wid=$(tmux show-option -gv "@last_win_for_${ws}" 2>/dev/null)
+    fi
+    if [[ -n "$saved_wid" && -n "${win_exists[$saved_wid]}" && "${win_ws[$saved_wid]}" == "$ws" ]]; then
+        target_wid="$saved_wid"
+        target_path="${win_path[$saved_wid]}"
+        target_idx="${win_idx[$saved_wid]}"
+    elif [[ -n "${ws_mru_wid[$ws]}" ]]; then
+        target_wid="${ws_mru_wid[$ws]}"
+        target_path="${ws_mru_path[$ws]}"
+        target_idx="${ws_mru_idx[$ws]}"
+    else
+        IFS="$TAB" read -r target_wid target_path target_idx <<< "${seen_ws[$ws]}"
+    fi
+    tab_cnt="${ws_tab_count[$ws]}"
+    tab_str="[${tab_cnt} tab$([ $tab_cnt -gt 1 ] && echo 's')]"
+
+    bar_num="${ws_bar_idx[$ws]}"
+    ws_num_to_wid["$bar_num"]="$target_wid"
+
+    label="[${bar_num}] ${WS_MUX_LABEL_PREFIX}$ws"
+    if [[ "$ws" == "~" ]]; then
+        label="[${bar_num}] ~"
+    fi
+
+    if [[ "$ws" == "$current_ws" ]]; then
+        tab_str="${tab_str} [current]"
+    fi
+
+    # Instant Cached JJ extraction
+    jj_info=""
+    if [[ "$ws" != "~" && -n "$target_path" ]]; then
+        ws_hash=$(ws_md5 "$target_path")
+        cache_file="$CACHE_DIR/$ws_hash"
+        
+        raw_jj=""
+        if [[ -f "$cache_file" ]]; then
+            raw_jj=$(<"$cache_file")
+            # If older than 45s, refresh asynchronously in background
+            mtime=$(ws_file_mtime "$cache_file")
+            now=$(date +%s)
+            if (( now - mtime > 45 )); then
+                ( fetch_jj_info "$target_path" "$cache_file" ) >/dev/null 2>&1 &
+            fi
+        else
+            ( fetch_jj_info "$target_path" "$cache_file" ) >/dev/null 2>&1 &
+        fi
+
+        if [[ -n "$raw_jj" ]]; then
+            IFS="$TAB" read -r rev conflict desc <<< "$raw_jj"
+            conflict_badge=""
+            if [[ "$conflict" == "CONFLICT" ]]; then
+                conflict_badge=" [CONFLICT]"
+            fi
+            if [[ -n "$desc" ]]; then
+                if [[ ${#desc} -gt 35 ]]; then
+                    desc="${desc:0:32}..."
+                fi
+                jj_info="@ ${rev}${conflict_badge} (${desc})"
+            elif [[ -n "$rev" ]]; then
+                jj_info="@ ${rev}${conflict_badge}"
+            fi
+        fi
+    fi
+
+    row=$(printf "%-26s\t%-50s\t%-18s\t%s" "$label" "$jj_info" "$tab_str" "$target_wid")
+    formatted_lines+="${row}"$'\n'
+done
+
+declare -a valid_nums=()
+for (( n=1; n<=${#all_ws[@]} && n<=9; n++ )); do
+    valid_nums+=("$n")
+done
+expect_arg=$(IFS=,; echo "${valid_nums[*]}")
+
+fzf_out=$(echo -ne "$formatted_lines" | fzf \
+  --reverse \
+  --delimiter="$TAB" \
+  --with-nth=1,2,3 \
+  --expect="$expect_arg" \
+  --header="Jump to ${WS_KIND_LABEL} Workspace (MRU | 1-${#valid_nums[@]}: Instant Tab Bar #)" \
+  --prompt="Workspace > " \
+  --bind 'ctrl-j:down,ctrl-k:up')
+
+if [[ -z "$fzf_out" ]]; then
+    exit 0
+fi
+
+pressed_key=$(printf "%s\n" "$fzf_out" | sed -n '1p')
+selected_line=$(printf "%s\n" "$fzf_out" | sed -n '2p')
+
+target_wid=""
+if [[ -n "$pressed_key" && -n "${ws_num_to_wid[$pressed_key]}" ]]; then
+    target_wid="${ws_num_to_wid[$pressed_key]}"
+elif [[ -n "$selected_line" ]]; then
+    target_wid=$(printf "%s" "$selected_line" | cut -f4)
+fi
+
+if [[ -n "$target_wid" ]]; then
+    tmux select-window -t "$target_wid"
+    ~/.local/bin/track-active-window "$current_sess" >/dev/null 2>&1
+fi
