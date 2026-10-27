@@ -24,6 +24,8 @@ DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORP_DIR="${DOTFILES_CORP_DIR:-$HOME/.dotfiles-corp}"
 OS="$(uname -s)"
 TS="$(date +%Y%m%d%H%M%S)"
+LOG="$HOME/.dotfiles-install.log"
+START=$SECONDS
 
 DO_PACKAGES=1
 DO_BOOTSTRAP=1
@@ -49,7 +51,22 @@ done
 # Pretty output
 # ------------------------------------------------------------------------------
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
-step() { printf "${YELLOW}==>${NC} %s\n" "$*"; }
+step() { printf "${YELLOW}==>${NC} %s ${BLUE}[%dm%02ds]${NC}\n" "$*" $(( (SECONDS-START)/60 )) $(( (SECONDS-START)%60 )); }
+
+# with_heartbeat <label> <cmd...>: run a quiet, slow command with its output in
+# $LOG, printing "still working" every 15s so it never looks hung.
+with_heartbeat() {
+  local label="$1"; shift
+  if [[ $DRY -eq 1 ]]; then info "[dry-run]" "$*"; return 0; fi
+  echo "----- $(date) $label: $*" >> "$LOG"
+  "$@" >> "$LOG" 2>&1 &
+  local pid=$! t=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1; t=$((t+1))
+    (( t % 15 == 0 )) && info "..." "$label still running (${t}s) - tail -f $LOG"
+  done
+  wait "$pid"
+}
 ok()   { printf "    ${GREEN}%s${NC} %s\n" "$1" "${2:-}"; }
 info() { printf "    ${BLUE}%s${NC} %s\n" "$1" "${2:-}"; }
 warn() { printf "    ${RED}!!${NC} %s\n" "$*"; }
@@ -177,7 +194,8 @@ install_packages_macos() {
     [[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
     [[ -x /usr/local/bin/brew ]] && eval "$(/usr/local/bin/brew shellenv)"
   fi
-  run brew bundle --file="$DOTFILES_DIR/Brewfile"
+  info "brew" "installing ~30 formulae/casks; first run typically 5-15 min (downloads show below)"
+  run brew bundle --verbose --file="$DOTFILES_DIR/Brewfile"
 }
 
 install_packages_linux() {
@@ -222,7 +240,7 @@ fi
 clone() {  # clone <url> <dest>
   if [[ -d "$2/.git" || -d "$2" ]]; then return 0; fi
   info "cloning" "$1 -> ${2/#$HOME/~}"
-  run git clone --depth=1 -q "$1" "$2"
+  run git clone --depth=1 -q "$1" "$2" 2>>"$LOG"
 }
 
 if [[ $DO_BOOTSTRAP -eq 1 ]]; then
@@ -351,10 +369,12 @@ done
 # ------------------------------------------------------------------------------
 if [[ $DO_BOOTSTRAP -eq 1 && $DRY -eq 0 ]]; then
   step "Installing tmux plugins (TPM)"
-  "$HOME/.tmux/plugins/tpm/bin/install_plugins" >/dev/null 2>&1 && ok "tmux" "plugins installed" || warn "TPM install failed; inside tmux press prefix + I"
+  with_heartbeat "TPM" "$HOME/.tmux/plugins/tpm/bin/install_plugins" && ok "tmux" "plugins installed" || warn "TPM install failed; inside tmux press prefix + I"
   if have nvim; then
     step "Installing neovim plugins (lazy.nvim) - may take a minute"
-    nvim --headless "+Lazy! restore" +qa >/dev/null 2>&1 && ok "nvim" "plugins restored from lazy-lock.json" || warn "lazy restore had errors; open nvim and run :Lazy"
+    info "nvim" "cloning ~45 plugins + compiling treesitter parsers; typically 1-5 min"
+    with_heartbeat "nvim plugins" nvim --headless "+Lazy! restore" +qa && ok "nvim" "plugins restored from lazy-lock.json" || warn "lazy restore had errors (see $LOG); open nvim and run :Lazy"
+    info "nvim" "LSP servers (mason) install in the background the first time you open nvim - see :Mason"
   fi
 fi
 
@@ -366,5 +386,6 @@ if [[ $ADOPT -eq 1 ]]; then
 fi
 
 printf "${GREEN}==============================================================================${NC}\n"
-printf "${GREEN}  DONE.${NC} Open a new terminal (or: exec zsh). Overrides go in ~/.zshrc.local etc.\n"
+printf "${GREEN}  DONE in %dm%02ds.${NC} Full log: %s\n" $(( (SECONDS-START)/60 )) $(( (SECONDS-START)%60 )) "$LOG"
+printf "${GREEN}  ${NC} Open a new terminal (or: exec zsh). Overrides go in ~/.zshrc.local etc.\n"
 printf "${GREEN}==============================================================================${NC}\n"
